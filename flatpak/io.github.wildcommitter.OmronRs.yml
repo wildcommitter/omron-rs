@@ -1,0 +1,56 @@
+# Flatpak manifest for `omron-rs`.
+#
+# Build locally with:
+#   flatpak-builder --user --install --force-clean \
+#     build-dir flatpak/io.github.wildcommitter.OmronRs.yml
+#
+# Then:
+#   flatpak run io.github.wildcommitter.OmronRs --help
+#
+# CI (.github/workflows/release.yml) bundles this into a single `.flatpak`
+# file that can be installed offline with `flatpak install ./omron-rs.flatpak`
+# and ships it as a GitHub Release artifact.
+
+app-id: io.github.wildcommitter.OmronRs
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: omron
+
+finish-args:
+  # `omron` is a CLI tool: no display, audio, filesystem-host, network,
+  # or session-bus permissions wanted. All BLE traffic (scan, GATT,
+  # pairing agent) goes through the system D-Bus connection to
+  # bluetoothd, which `--system-talk-name=org.bluez` authorises.
+  # Bluetoothd's callbacks into our pairing agent ride on the same
+  # already-established D-Bus connection, so no extra "own-name"
+  # permission is required.
+  - --system-talk-name=org.bluez
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/omron-rs/cargo
+
+modules:
+  - name: omron-rs
+    buildsystem: simple
+    build-options:
+      build-args:
+        # Cargo needs network to fetch crates.io tarballs. The
+        # alternative is generating a `cargo-sources.json` ahead of
+        # time with `flatpak-cargo-generator.py` and committing
+        # vendored sources; for a GitHub-hosted release this is
+        # unnecessary, but a Flathub submission would require it.
+        - --share=network
+    build-commands:
+      - cargo build --release --locked --verbose
+      - install -Dm755 ./target/release/omron /app/bin/omron
+      - install -Dm644 README.md /app/share/omron-rs/README.md
+      - install -Dm644 flatpak/io.github.wildcommitter.OmronRs.metainfo.xml
+        /app/share/metainfo/io.github.wildcommitter.OmronRs.metainfo.xml
+    sources:
+      - type: dir
+        path: ..

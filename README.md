@@ -8,7 +8,27 @@ integration doesn't cover.
 
 [upstream]: https://github.com/eigger/hass-omron
 
-## Build
+## Install
+
+### Flatpak (release artifacts on GitHub Releases)
+
+Each tagged release ships an `omron-rs.flatpak` single-file bundle built
+by `.github/workflows/release.yml`. Install with:
+
+```sh
+# Grab omron-rs.flatpak from the latest release, then:
+flatpak install --user ./omron-rs.flatpak
+alias omron='flatpak run io.github.wildcommitter.OmronRs'
+omron --help
+```
+
+Only permission requested is `--system-talk-name=org.bluez` (talk to BlueZ
+over the system D-Bus); no display / filesystem / network sandbox holes.
+Manifest is `flatpak/io.github.wildcommitter.OmronRs.yml` if you want to
+build locally with `flatpak-builder --user --install --force-clean
+build flatpak/io.github.wildcommitter.OmronRs.yml`.
+
+### From source
 
 ```sh
 cargo build --release

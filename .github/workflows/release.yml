@@ -1,0 +1,66 @@
+name: Release Flatpak
+
+# Tag pushes (v*) cut a GitHub Release and attach the .flatpak bundle
+# as a release artifact. Manual workflow_dispatch runs upload the bundle
+# as a workflow artifact only (useful for testing the build without
+# cutting a release).
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write  # required by softprops/action-gh-release to upload assets
+
+jobs:
+  flatpak:
+    name: Build Flatpak bundle (x86_64)
+    runs-on: ubuntu-latest
+    # The flatpak-github-actions image bundles flatpak-builder, the
+    # freedesktop runtime + SDK, and the rust-stable SDK extension, so
+    # the build inside this container can stay offline-friendly
+    # (everything except the crates.io fetches is local).
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-23.08
+      options: --privileged
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build .flatpak bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: omron-rs.flatpak
+          manifest-path: flatpak/io.github.wildcommitter.OmronRs.yml
+          # Reuse cargo / flatpak-builder caches between runs.
+          cache-key: flatpak-builder-${{ hashFiles('Cargo.lock', 'flatpak/io.github.wildcommitter.OmronRs.yml') }}
+
+      - name: Attach bundle to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: omron-rs.flatpak
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            ```sh
+            # Download omron-rs.flatpak from this release, then:
+            flatpak install --user ./omron-rs.flatpak
+            alias omron='flatpak run io.github.wildcommitter.OmronRs'
+            omron --help
+            ```
+
+            On first run the binary will try to register a BlueZ
+            pairing agent on the system bus; allow it when prompted
+            (or pre-grant with `flatpak permission-set ...`).
+
+      - name: Upload bundle as workflow artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: omron-rs-flatpak
+          path: omron-rs.flatpak
+          if-no-files-found: error

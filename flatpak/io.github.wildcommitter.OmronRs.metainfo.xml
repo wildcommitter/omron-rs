@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.wildcommitter.OmronRs</id>
+  <name>omron-rs</name>
+  <summary>Scan, pair, and read data from Omron BLE blood-pressure monitors</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/wildcommitter/omron-rs</url>
+  <url type="bugtracker">https://github.com/wildcommitter/omron-rs/issues</url>
+  <description>
+    <p>
+      A command-line tool that talks Bluetooth Low Energy to Omron blood
+      pressure monitors. Supports the proprietary Omron memory protocol
+      (for HEM-* cuffs) and the BLE-standard Blood Pressure Service /
+      RACP (for any spec-compliant cuff, e.g. the Omron Complete).
+    </p>
+    <p>Subcommands include:</p>
+    <ul>
+      <li>scan — discover nearby Omron devices</li>
+      <li>info — read Device Information and GATT tree</li>
+      <li>pair — drive in-process BlueZ Just-Works bonding + Omron app-level key</li>
+      <li>read — drain stored records via Omron's memory protocol</li>
+      <li>read-bps — subscribe to BLE-standard BP Measurement indications</li>
+      <li>sync — drain every stored record via RACP (--format table|json|csv)</li>
+      <li>set-time — write the cuff's wall clock via the standard Current Time Service</li>
+      <li>probe — generic subscribe-and-dump for reverse-engineering vendor characteristics</li>
+    </ul>
+  </description>
+  <provides>
+    <binary>omron</binary>
+  </provides>
+  <categories>
+    <category>Utility</category>
+  </categories>
+  <releases>
+    <release version="0.1.0" date="2026-05-24">
+      <description>
+        <p>Initial Flatpak release.</p>
+      </description>
+    </release>
+  </releases>
+  <content_rating type="oars-1.1" />
+</component>
