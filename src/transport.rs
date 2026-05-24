@@ -85,13 +85,26 @@ pub struct GattTransport {
 
 impl GattTransport {
     pub async fn new(peripheral: Peripheral, config: DeviceConfig) -> Result<Self> {
+        // Self-heal: Omron cuffs sleep aggressively, so the link may have
+        // dropped between connect() and here. Try one quick reconnect before
+        // giving up.
         if !peripheral.is_connected().await? {
-            return Err(OmronError::Disconnected("transport construct".into()));
+            debug!("transport construct: link dropped, reconnecting");
+            peripheral.connect().await?;
+            sleep(Duration::from_millis(200)).await;
         }
-        peripheral.discover_services().await?;
+        // Only force a rediscovery if btleplug doesn't already have the GATT
+        // tree cached — on BlueZ a fresh discover_services() can take several
+        // seconds and the cuff will sleep through it.
+        if peripheral.characteristics().is_empty() {
+            peripheral.discover_services().await?;
+        }
         let mut chars: HashMap<Uuid, Characteristic> = HashMap::new();
         for c in peripheral.characteristics() {
             chars.insert(c.uuid, c);
+        }
+        if chars.is_empty() {
+            return Err(OmronError::Other("no GATT characteristics found".into()));
         }
         Ok(Self {
             peripheral,

@@ -10,11 +10,15 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use omron_rs::ble::{default_adapter, find_peripheral_by_address, scan_for_omron};
-use omron_rs::consts::DEFAULT_DEVICE_MODEL;
+use omron_rs::consts::{
+    BATTERY_LEVEL_UUID, DEFAULT_DEVICE_MODEL, FIRMWARE_REVISION_UUID, HARDWARE_REVISION_UUID,
+    MANUFACTURER_NAME_UUID, MODEL_NUMBER_UUID,
+};
 use omron_rs::devices::{get_device_config, infer_model_id_from_local_name, supported_models};
 use omron_rs::driver::OmronDeviceDriver;
 use omron_rs::setup::{establish_connection, fetch_device_model_number, pair_and_sync_device};
 use omron_rs::transport::GattTransport;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -63,6 +67,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Connect read-only and print Device Information (Model, Firmware, etc.)
+    /// plus every advertised GATT service/characteristic. No pairing, no unlock,
+    /// no EEPROM access. Safe to run on a never-paired cuff.
+    Info {
+        /// Bluetooth MAC address of the cuff.
+        address: String,
+    },
     /// List all supported model IDs (including catalog variants).
     ListModels,
 }
@@ -79,6 +90,7 @@ async fn main() -> Result<()> {
         Command::Scan { seconds, json } => cmd_scan(seconds, json).await,
         Command::Pair { address, model } => cmd_pair(address, model).await,
         Command::Read { address, model, latest, json } => cmd_read(address, model, latest, json).await,
+        Command::Info { address } => cmd_info(address).await,
         Command::ListModels => {
             for m in supported_models() {
                 println!("{m}");
@@ -207,6 +219,79 @@ async fn cmd_read(
         } else {
             print_records(&records);
         }
+    }
+    Ok(())
+}
+
+async fn cmd_info(address: String) -> Result<()> {
+    let adapter = default_adapter().await?;
+    println!("Scanning for {address}…");
+    let peripheral = find_peripheral_by_address(&adapter, &address)
+        .await
+        .context("could not find the device — is it powered on and in range?")?;
+
+    establish_connection(&peripheral).await?;
+    println!("Connected. Reading Device Information…");
+
+    async fn read_string(peripheral: &btleplug::platform::Peripheral, uuid: Uuid, label: &str) -> Option<String> {
+        for c in peripheral.characteristics() {
+            if c.uuid == uuid {
+                match peripheral.read(&c).await {
+                    Ok(bytes) => {
+                        let s = String::from_utf8_lossy(&bytes)
+                            .trim_matches(|c: char| c == ' ' || c == '\0')
+                            .to_string();
+                        println!("  {label:24} = {s:?}");
+                        return Some(s);
+                    }
+                    Err(e) => {
+                        println!("  {label:24} read failed: {e}");
+                        return None;
+                    }
+                }
+            }
+        }
+        println!("  {label:24} (characteristic not present)");
+        None
+    }
+
+    read_string(&peripheral, MANUFACTURER_NAME_UUID, "Manufacturer (0x2A29)").await;
+    let model_str = read_string(&peripheral, MODEL_NUMBER_UUID, "Model Number (0x2A24)").await;
+    read_string(&peripheral, FIRMWARE_REVISION_UUID, "Firmware Rev (0x2A26)").await;
+    read_string(&peripheral, HARDWARE_REVISION_UUID, "Hardware Rev (0x2A27)").await;
+
+    // Battery Level is a single byte 0..100
+    for c in peripheral.characteristics() {
+        if c.uuid == BATTERY_LEVEL_UUID {
+            match peripheral.read(&c).await {
+                Ok(b) if !b.is_empty() => println!("  {label:24} = {pct}%", label = "Battery Level (0x2A19)", pct = b[0]),
+                Ok(_) => println!("  Battery Level (0x2A19) = (empty read)"),
+                Err(e) => println!("  Battery Level (0x2A19) read failed: {e}"),
+            }
+        }
+    }
+
+    println!("\nGATT services:");
+    for s in peripheral.services() {
+        println!("  service {}", s.uuid);
+        for c in &s.characteristics {
+            let mut props: Vec<&str> = Vec::new();
+            if c.properties.contains(btleplug::api::CharPropFlags::READ) { props.push("read"); }
+            if c.properties.contains(btleplug::api::CharPropFlags::WRITE) { props.push("write"); }
+            if c.properties.contains(btleplug::api::CharPropFlags::WRITE_WITHOUT_RESPONSE) { props.push("write_no_resp"); }
+            if c.properties.contains(btleplug::api::CharPropFlags::NOTIFY) { props.push("notify"); }
+            if c.properties.contains(btleplug::api::CharPropFlags::INDICATE) { props.push("indicate"); }
+            println!("    char    {}  [{}]", c.uuid, props.join(","));
+        }
+    }
+
+    if let Some(model_str) = model_str {
+        let inferred = infer_model_id_from_local_name(&model_str);
+        println!(
+            "\nInferred profile for model string {:?}: {}",
+            model_str,
+            inferred.as_deref().unwrap_or("(unrecognized — use --model to override)")
+        );
     }
     Ok(())
 }

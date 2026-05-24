@@ -15,23 +15,39 @@ use crate::error::{OmronError, Result};
 use crate::time_sync::sync_device_time;
 use crate::transport::GattTransport;
 
-/// Bond-settle pause after `connect()` returns. Matches the
-/// `_POST_CONNECT_BOND_SETTLE_SEC` constant in `omron_driver.py`.
-const POST_CONNECT_BOND_SETTLE: Duration = Duration::from_millis(1500);
+/// Default bond-settle pause after `connect()` returns. The Python integration
+/// uses 1500ms (`_POST_CONNECT_BOND_SETTLE_SEC`) — that's needed when OS-level
+/// bonding is racing GATT discovery on modern-stack profiles. Classic-stack
+/// devices don't need any settle and many cuffs sleep within ~300ms of
+/// connecting, so the default here is zero; call
+/// [`establish_connection_with_settle`] explicitly when targeting OS-bonding
+/// profiles.
+const DEFAULT_POST_CONNECT_SETTLE: Duration = Duration::from_millis(0);
 
-/// Connect to the peripheral, wait for the BLE link to settle, and refresh
+/// Connect to the peripheral, wait briefly for the link to settle, and refresh
 /// the GATT cache. Use this everywhere instead of calling `peripheral.connect()`
-/// directly so the bond-settle behaviour stays consistent.
+/// directly so the post-connect behaviour stays consistent.
 pub async fn establish_connection(peripheral: &Peripheral) -> Result<()> {
+    establish_connection_with_settle(peripheral, DEFAULT_POST_CONNECT_SETTLE).await
+}
+
+/// Like [`establish_connection`] but with an explicit settle duration. Use a
+/// longer settle (≈1500ms) on modern-stack profiles where OS bonding may race
+/// GATT discovery.
+pub async fn establish_connection_with_settle(
+    peripheral: &Peripheral,
+    settle: Duration,
+) -> Result<()> {
     if !peripheral.is_connected().await? {
         peripheral.connect().await?;
     }
-    debug!(
-        "BLE link established; settling {:?} before first GATT op",
-        POST_CONNECT_BOND_SETTLE
-    );
-    sleep(POST_CONNECT_BOND_SETTLE).await;
-    peripheral.discover_services().await?;
+    debug!("BLE link established; settling {:?} before first GATT op", settle);
+    sleep(settle).await;
+    // Skip discovery if btleplug already has services cached — on BlueZ this
+    // can take seconds and the cuff will sleep through it.
+    if peripheral.services().is_empty() {
+        peripheral.discover_services().await?;
+    }
     Ok(())
 }
 
