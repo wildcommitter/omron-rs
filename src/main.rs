@@ -128,6 +128,25 @@ enum Command {
         #[arg(long)]
         bond: bool,
     },
+    /// Set the cuff's wall-clock via the BLE-standard Current Time Service
+    /// (UUID 0x2A2B), and optionally the Local Time Information (0x2A0F)
+    /// for timezone / DST. Useful when stored measurement timestamps drift
+    /// after a battery change or the cuff has no UI for setting time.
+    /// Requires OS-level bonding.
+    SetTime {
+        /// Bluetooth MAC address of the cuff.
+        address: String,
+        /// Skip the Local Time Information write (just the wall clock).
+        #[arg(long)]
+        no_tz: bool,
+        /// After writing, read CTS back and print the decoded value to
+        /// confirm the cuff accepted the change.
+        #[arg(long)]
+        verify: bool,
+        /// Force a fresh OS-level pairing first. Linux only.
+        #[arg(long)]
+        bond: bool,
+    },
     /// List all supported model IDs (including catalog variants).
     ListModels,
 }
@@ -150,6 +169,9 @@ async fn main() -> Result<()> {
         }
         Command::Sync { address, num_only, json, timeout, bond } => {
             cmd_sync(address, num_only, json, timeout, bond).await
+        }
+        Command::SetTime { address, no_tz, verify, bond } => {
+            cmd_set_time(address, no_tz, verify, bond).await
         }
         Command::ListModels => {
             for m in supported_models() {
@@ -567,6 +589,105 @@ async fn cmd_sync(
             _ => {}
         }
     }
+    Ok(())
+}
+
+async fn cmd_set_time(
+    address: String,
+    no_tz: bool,
+    verify: bool,
+    bond: bool,
+) -> Result<()> {
+    use btleplug::api::WriteType;
+    use chrono::Local;
+    use omron_rs::consts::{CTS_CHARACTERISTIC_UUID, LOCAL_TIME_INFO_UUID};
+    use omron_rs::time_sync::{build_cts_payload, decode_cts_payload};
+
+    #[cfg(target_os = "linux")]
+    let _bonding = establish_os_bond(&address, bond).await?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = bond;
+
+    let adapter = default_adapter().await?;
+    println!("Scanning for {address}…");
+    let peripheral = find_peripheral_by_address(&adapter, &address)
+        .await
+        .context("could not find the device — is it powered on and in range?")?;
+    establish_connection(&peripheral).await?;
+
+    let chars: Vec<_> = peripheral.characteristics().into_iter().collect();
+    let cts = chars
+        .iter()
+        .find(|c| c.uuid == CTS_CHARACTERISTIC_UUID)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "device does not expose Current Time Service char {} \
+                 — it may not implement BLE-standard CTS",
+                CTS_CHARACTERISTIC_UUID
+            )
+        })?;
+
+    let now = Local::now();
+    let payload = build_cts_payload(now);
+    println!(
+        "Writing CTS (0x2A2B) = {} ({})",
+        hex::encode(&payload),
+        now.format("%Y-%m-%d %H:%M:%S %z")
+    );
+    peripheral
+        .write(&cts, &payload, WriteType::WithResponse)
+        .await
+        .context("CTS write failed")?;
+
+    if !no_tz {
+        if let Some(lti) = chars.iter().find(|c| c.uuid == LOCAL_TIME_INFO_UUID).cloned() {
+            // Timezone in 15-minute units (i8), DST byte: chrono doesn't surface
+            // DST cleanly in stable so leave it 0 (standard time).
+            let utc_off_mins = now.offset().local_minus_utc() / 60;
+            let tz_offset_15m = (utc_off_mins / 15) as i8;
+            let lti_payload = [tz_offset_15m as u8, 0x00];
+            println!(
+                "Writing Local Time Info (0x2A0F) = {} (tz_offset_15m={})",
+                hex::encode(lti_payload),
+                tz_offset_15m
+            );
+            if let Err(e) = peripheral.write(&lti, &lti_payload, WriteType::WithResponse).await {
+                eprintln!("LTI write failed (continuing): {e}");
+            }
+        } else {
+            println!("Local Time Info characteristic not present — skipping timezone write.");
+        }
+    }
+
+    if verify {
+        match peripheral.read(&cts).await {
+            Ok(bytes) => {
+                println!("CTS read-back: {}", hex::encode(&bytes));
+                if let Some(decoded) = decode_cts_payload(&bytes) {
+                    let now_local = now.naive_local();
+                    let drift = (decoded.datetime - now_local).num_milliseconds().abs();
+                    println!(
+                        "  decoded: {}  weekday={}  drift={}ms",
+                        decoded.datetime.format("%Y-%m-%d %H:%M:%S"),
+                        decoded.day_of_week,
+                        drift
+                    );
+                    // The cuff may be a tick ahead/behind — 2s is well
+                    // within BLE round-trip + cuff clock granularity.
+                    if drift > 2000 {
+                        eprintln!("  warning: drift > 2s, the cuff may not have accepted the write");
+                    }
+                } else {
+                    eprintln!("  failed to decode read-back payload");
+                }
+            }
+            Err(e) => eprintln!("CTS read-back failed (write may still have stuck): {e}"),
+        }
+    }
+
+    let _ = peripheral.disconnect().await;
+    println!("Done.");
     Ok(())
 }
 

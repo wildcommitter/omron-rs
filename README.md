@@ -28,6 +28,7 @@ BlueZ 5.86 on a built-in Intel adapter.
 | `read`       | Drain stored measurements via Omron's classic memory protocol. For `HEM-*` cuffs in the supported list. |
 | `read-bps`   | Subscribe to BLE-standard BP Measurement indications (`0x2A35`). For BPS-compliant cuffs.             |
 | `sync`       | Drain *every* stored record via BLE-standard RACP (`0x2A52`). For BPS-compliant cuffs.                |
+| `set-time`   | Write the cuff's wall-clock via BLE-standard Current Time Service (`0x2A2B`). See caveat below.       |
 | `list-models`| Print all 202 supported model IDs (canonical profiles + aliases).                                     |
 
 Run `omron <subcommand> --help` for flags.
@@ -149,6 +150,14 @@ needs hardware to exercise.
 
 ## Known limitations
 
+- **`set-time` on the Omron Complete (BP7900) fails with ATT `0x80`** even
+  after a fresh OS bond. The cuff's CTS write permission is set to
+  "encrypted + authenticated", but Just Works pairing (the only model
+  the cuff's no-input/no-output I/O capabilities can support) only
+  produces unauthenticated keys. The `set-time` implementation is
+  GATT-spec correct and works on devices whose CTS char doesn't have
+  this elevated requirement; for Omron BP7900 the official app
+  apparently writes time through the vendor protocol instead.
 - **Omron's "legacy probe"** (0x02+zeros on the unlock characteristic) is
   deliberately disabled — on the cuffs we tested it put the device into
   key-programming mode mid-unlock and broke the memory session. See the

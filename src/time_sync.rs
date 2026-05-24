@@ -14,6 +14,39 @@ use crate::device_config::{DeviceConfig, TimeSyncLayout};
 use crate::error::Result;
 use crate::transport::GattTransport;
 
+/// Decoded representation of the Bluetooth CTS Current Time characteristic
+/// (`0x2A2B`). The standard payload is 10 bytes; this type holds the parsed
+/// fields without the day-of-week / fractions / adjust-reason metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CtsTime {
+    pub datetime: chrono::NaiveDateTime,
+    pub day_of_week: u8,
+    pub fractions_256: u8,
+    pub adjust_reason: u8,
+}
+
+/// Decode a CTS `0x2A2B` payload. Returns `None` if the payload is the wrong
+/// length or carries an invalid date.
+pub fn decode_cts_payload(data: &[u8]) -> Option<CtsTime> {
+    if data.len() < 10 {
+        return None;
+    }
+    let year = u16::from_le_bytes([data[0], data[1]]) as i32;
+    let month = data[2] as u32;
+    let day = data[3] as u32;
+    let hour = data[4] as u32;
+    let minute = data[5] as u32;
+    let second = data[6] as u32;
+    let datetime = chrono::NaiveDate::from_ymd_opt(year, month, day)?
+        .and_hms_opt(hour, minute, second.min(59))?;
+    Some(CtsTime {
+        datetime,
+        day_of_week: data[7],
+        fractions_256: data[8],
+        adjust_reason: data[9],
+    })
+}
+
 /// Build the 10-byte Bluetooth CTS payload from a local timezone-aware datetime.
 pub fn build_cts_payload(now: DateTime<Local>) -> Vec<u8> {
     let year = now.year() as u16;
@@ -336,6 +369,27 @@ mod tests {
         let out = encode_eeprom_time_payload(TimeSyncLayout::ModernOffset8, &cached, now);
         let parsed = decode_eeprom_time_payload(TimeSyncLayout::ModernOffset8, &out).unwrap();
         assert_eq!(parsed.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-24 16:57:12");
+    }
+
+    #[test]
+    fn cts_round_trips_through_decode() {
+        let now = now_2026_05_24_16_57_12();
+        let bytes = build_cts_payload(now);
+        let decoded = decode_cts_payload(&bytes).unwrap();
+        assert_eq!(decoded.datetime.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-05-24 16:57:12");
+        // 2026-05-24 is a Sunday → ISO weekday 7
+        assert_eq!(decoded.day_of_week, 7);
+        assert_eq!(decoded.fractions_256, 0);
+        assert_eq!(decoded.adjust_reason, 0);
+    }
+
+    #[test]
+    fn cts_decode_rejects_truncated_or_invalid() {
+        assert!(decode_cts_payload(&[]).is_none());
+        assert!(decode_cts_payload(&[0xEA, 0x07, 5, 24, 16, 57, 12]).is_none()); // 7 < 10
+        // Month 13 invalid
+        let bad = [0xEA, 0x07, 13, 1, 0, 0, 0, 1, 0, 0];
+        assert!(decode_cts_payload(&bad).is_none());
     }
 
     #[test]
