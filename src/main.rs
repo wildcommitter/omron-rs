@@ -128,6 +128,29 @@ enum Command {
         #[arg(long)]
         bond: bool,
     },
+    /// Subscribe to an arbitrary GATT characteristic by UUID and dump every
+    /// indication / notification it produces (relative timestamp, length,
+    /// hex bytes). Useful for reverse-engineering vendor-specific
+    /// characteristics on Omron cuffs — e.g. the `c195da8a-…` indicate
+    /// channel on the Omron Complete which is unspecified and almost
+    /// certainly carries the single-lead EKG strip. Trigger whatever
+    /// causes the device to emit data (take a measurement, hold the EKG
+    /// button, etc.) while this is running.
+    Probe {
+        /// Bluetooth MAC address of the cuff.
+        address: String,
+        /// Characteristic UUID to subscribe to.
+        uuid: String,
+        /// How long to listen, in seconds.
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        /// Print packet payload bytes as inline ASCII (`.` for non-printable).
+        #[arg(long)]
+        ascii: bool,
+        /// Force a fresh OS-level pairing first. Linux only.
+        #[arg(long)]
+        bond: bool,
+    },
     /// Set the cuff's wall-clock via the BLE-standard Current Time Service
     /// (UUID 0x2A2B), and optionally the Local Time Information (0x2A0F)
     /// for timezone / DST. Useful when stored measurement timestamps drift
@@ -172,6 +195,9 @@ async fn main() -> Result<()> {
         }
         Command::SetTime { address, no_tz, verify, bond } => {
             cmd_set_time(address, no_tz, verify, bond).await
+        }
+        Command::Probe { address, uuid, seconds, ascii, bond } => {
+            cmd_probe(address, uuid, seconds, ascii, bond).await
         }
         Command::ListModels => {
             for m in supported_models() {
@@ -589,6 +615,94 @@ async fn cmd_sync(
             _ => {}
         }
     }
+    Ok(())
+}
+
+async fn cmd_probe(
+    address: String,
+    uuid_str: String,
+    seconds: u64,
+    ascii: bool,
+    bond: bool,
+) -> Result<()> {
+    let target_uuid: Uuid = uuid_str
+        .parse()
+        .with_context(|| format!("invalid UUID {:?}", uuid_str))?;
+
+    #[cfg(target_os = "linux")]
+    let _bonding = establish_os_bond(&address, bond).await?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = bond;
+
+    let adapter = default_adapter().await?;
+    println!("Scanning for {address}…");
+    let peripheral = find_peripheral_by_address(&adapter, &address)
+        .await
+        .context("could not find the device")?;
+    establish_connection(&peripheral).await?;
+
+    let char = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == target_uuid)
+        .ok_or_else(|| anyhow!("device does not expose characteristic {}", target_uuid))?;
+
+    let mut stream = peripheral.notifications().await?;
+    peripheral
+        .subscribe(&char)
+        .await
+        .context("subscribe failed — characteristic may need bonding or different props")?;
+
+    println!(
+        "Subscribed to {target_uuid}. Listening for {seconds}s (Ctrl-C to stop). \
+         Trigger the measurement on the cuff now."
+    );
+    println!("{:>10}  {:>4}  bytes", "t (ms)", "len");
+
+    let start = std::time::Instant::now();
+    let deadline = start + std::time::Duration::from_secs(seconds);
+    let mut packet_no = 0usize;
+    let mut total_bytes = 0usize;
+    while tokio::time::Instant::now() < deadline.into() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let next = tokio::time::timeout(remaining, stream.next()).await;
+        match next {
+            Err(_) => break,
+            Ok(None) => break,
+            Ok(Some(n)) => {
+                if n.uuid != target_uuid {
+                    continue;
+                }
+                packet_no += 1;
+                total_bytes += n.value.len();
+                let elapsed_ms = start.elapsed().as_millis();
+                let hex_str = hex::encode(&n.value);
+                if ascii {
+                    let ascii_str: String = n
+                        .value
+                        .iter()
+                        .map(|b| if (0x20..=0x7E).contains(b) { *b as char } else { '.' })
+                        .collect();
+                    println!("{elapsed_ms:>10}  {:>4}  {hex_str}  |{ascii_str}|", n.value.len());
+                } else {
+                    println!("{elapsed_ms:>10}  {:>4}  {hex_str}", n.value.len());
+                }
+            }
+        }
+    }
+
+    let _ = peripheral.unsubscribe(&char).await;
+    let _ = peripheral.disconnect().await;
+    let elapsed = start.elapsed();
+    println!(
+        "\nReceived {packet_no} packet(s), {total_bytes} total bytes over {:.1}s ({:.1} B/s).",
+        elapsed.as_secs_f32(),
+        if elapsed.as_secs_f32() > 0.0 {
+            total_bytes as f32 / elapsed.as_secs_f32()
+        } else {
+            0.0
+        }
+    );
     Ok(())
 }
 
