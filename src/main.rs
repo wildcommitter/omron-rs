@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use btleplug::api::Peripheral as _;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
 use futures::StreamExt;
@@ -90,9 +90,12 @@ enum Command {
         /// Just report the number of stored records — don't fetch them.
         #[arg(long)]
         num_only: bool,
-        /// Emit one JSON object per record instead of the table format.
-        #[arg(long)]
-        json: bool,
+        /// Output format. `table` is the default human-readable form;
+        /// `json` emits one JSON object per record (newline-delimited
+        /// JSON, ready for `jq`); `csv` emits a header row plus one
+        /// row per record.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
         /// Overall timeout in seconds.
         #[arg(long, default_value_t = 90)]
         timeout: u64,
@@ -174,6 +177,22 @@ enum Command {
     ListModels,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// Human-readable table (one line per record).
+    Table,
+    /// Newline-delimited JSON (one object per line).
+    Json,
+    /// CSV with a header row.
+    Csv,
+}
+
+impl OutputFormat {
+    fn is_human(self) -> bool {
+        matches!(self, OutputFormat::Table)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -190,8 +209,8 @@ async fn main() -> Result<()> {
         Command::ReadBps { address, timeout, count, json, bond } => {
             cmd_read_bps(address, timeout, count, json, bond).await
         }
-        Command::Sync { address, num_only, json, timeout, bond } => {
-            cmd_sync(address, num_only, json, timeout, bond).await
+        Command::Sync { address, num_only, format, timeout, bond } => {
+            cmd_sync(address, num_only, format, timeout, bond).await
         }
         Command::SetTime { address, no_tz, verify, bond } => {
             cmd_set_time(address, no_tz, verify, bond).await
@@ -266,25 +285,27 @@ async fn establish_os_bond(address: &str, force_fresh: bool) -> Result<omron_rs:
     let session = BondingSession::new()
         .await
         .context("register in-process BlueZ pairing agent")?;
-    println!(
+    // All bonding-status messages go to stderr so commands like `omron
+    // sync --format csv > records.csv` produce clean files.
+    eprintln!(
         "Registered Just-Works pairing agent on adapter {}.",
         session.adapter_name()
     );
     if force_fresh {
         let _ = session.forget(addr).await;
     } else if session.is_paired(addr).await.unwrap_or(false) {
-        println!("Reusing existing OS bond with {address} (pass --bond to force refresh).");
+        eprintln!("Reusing existing OS bond with {address} (pass --bond to force refresh).");
         return Ok(session);
     }
     session
         .ensure_discovered(addr, Duration::from_secs(15))
         .await
         .context("device did not appear in BlueZ discovery (is it advertising?)")?;
-    println!("Bonding with {address} via BlueZ Just-Works…");
+    eprintln!("Bonding with {address} via BlueZ Just-Works…");
     session
         .pair_and_trust(addr, Duration::from_secs(30))
         .await?;
-    println!("OS-level bond established.");
+    eprintln!("OS-level bond established.");
     Ok(session)
 }
 
@@ -461,12 +482,14 @@ async fn cmd_info(address: String) -> Result<()> {
 async fn cmd_sync(
     address: String,
     num_only: bool,
-    json: bool,
+    format: OutputFormat,
     timeout_secs: u64,
     bond: bool,
 ) -> Result<()> {
     use btleplug::api::WriteType;
     use omron_rs::racp::RacpIndication;
+
+    let human = format.is_human();
 
     // Ensure an OS bond. By default we reuse any existing bond
     // (`force_fresh=false`); with `--bond` we drop the cached LTK and do
@@ -477,9 +500,8 @@ async fn cmd_sync(
     let _ = bond;
 
     let adapter = default_adapter().await?;
-    if !json {
-        println!("Scanning for {address}…");
-    }
+    // Always to stderr — keep stdout for the data stream only.
+    eprintln!("Scanning for {address}…");
     let peripheral = find_peripheral_by_address(&adapter, &address)
         .await
         .context("could not find the device — is it powered on and in range?")?;
@@ -517,12 +539,15 @@ async fn cmd_sync(
     } else {
         racp::build_report_all_records()
     };
-    if !json {
+    if human {
         println!(
             "Sending RACP request {} ({})…",
             hex::encode(request),
             if num_only { "Report Number of Stored Records" } else { "Report All Stored Records" }
         );
+    }
+    if format == OutputFormat::Csv && !num_only {
+        println!("datetime,sys,dia,map,unit,bpm,user_id,status");
     }
     peripheral
         .write(&racp_char, &request, WriteType::WithResponse)
@@ -545,10 +570,16 @@ async fn cmd_sync(
                 if n.uuid == BP_MEASUREMENT_CHAR_UUID {
                     match decode_bp_measurement(&n.value) {
                         Ok(m) => {
-                            if json {
-                                println!("{}", serde_json::to_string(&m)?);
-                            } else {
-                                print_bps_measurement(&m);
+                            match format {
+                                OutputFormat::Json => {
+                                    println!("{}", serde_json::to_string(&m)?);
+                                }
+                                OutputFormat::Csv => {
+                                    print_bps_measurement_csv(&m);
+                                }
+                                OutputFormat::Table => {
+                                    print_bps_measurement(&m);
+                                }
                             }
                             records.push(m);
                         }
@@ -563,7 +594,7 @@ async fn cmd_sync(
                         Ok(ind) => match ind {
                             RacpIndication::NumberOfRecords(n) => {
                                 announced_count = Some(n);
-                                if !json {
+                                if human {
                                     println!("Device reports {} stored record(s).", n);
                                 }
                                 if num_only {
@@ -591,7 +622,7 @@ async fn cmd_sync(
     let _ = peripheral.unsubscribe(&racp_char).await;
     let _ = peripheral.disconnect().await;
 
-    if !json {
+    if human {
         match completion {
             Some(RacpIndication::Response { request, result }) => {
                 println!(
@@ -904,6 +935,33 @@ async fn cmd_read_bps(
     }
     let _ = all;
     Ok(())
+}
+
+/// One CSV row per record. Schema (matches the header in `cmd_sync`):
+///   `datetime,sys,dia,map,unit,bpm,user_id,status`
+///
+/// Numeric fields are written as plain decimals (no quoting; values are
+/// guaranteed comma- and quote-free). `datetime` is ISO-8601 with second
+/// precision, or empty when the cuff didn't carry a timestamp.  `status`
+/// is the raw `u16` bitmask as a decimal, matching the BLE spec.
+fn print_bps_measurement_csv(m: &BpsMeasurement) {
+    let dt = m
+        .datetime
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
+        .unwrap_or_default();
+    let unit = match m.unit {
+        omron_rs::bps::BpUnit::Mmhg => "mmHg",
+        omron_rs::bps::BpUnit::Kpa => "kPa",
+    };
+    let bpm = m.bpm.map(|v| format!("{v:.0}")).unwrap_or_default();
+    let user = m.user_id.map(|u| u.to_string()).unwrap_or_default();
+    let status = m.status.map(|s| s.bits().to_string()).unwrap_or_default();
+    println!(
+        "{dt},{sys:.0},{dia:.0},{map:.0},{unit},{bpm},{user},{status}",
+        sys = m.sys,
+        dia = m.dia,
+        map = m.map,
+    );
 }
 
 fn print_bps_measurement(m: &BpsMeasurement) {

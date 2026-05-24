@@ -88,8 +88,10 @@ Reusing existing OS bond with 00:5F:BF:A2:C6:C9 (pass --bond to force refresh).
 RACP completion: request=ReportStoredRecords result=Success (received 90 record(s))
 ```
 
-`--json` on `read-bps`, `sync`, and `read` emits one record per line as JSON
-for piping into other tools.
+`sync` accepts `--format {table,json,csv}` for output (default `table`).
+CSV is `datetime,sys,dia,map,unit,bpm,user_id,status` and is ready to pipe
+into a spreadsheet or a SQLite `.import`. `--json` on `read-bps` and
+`read` emits one JSON record per line for piping into `jq`.
 
 ## Pairing mode (`-P-`)
 
