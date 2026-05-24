@@ -29,6 +29,7 @@ BlueZ 5.86 on a built-in Intel adapter.
 | `read-bps`   | Subscribe to BLE-standard BP Measurement indications (`0x2A35`). For BPS-compliant cuffs.             |
 | `sync`       | Drain *every* stored record via BLE-standard RACP (`0x2A52`). For BPS-compliant cuffs.                |
 | `set-time`   | Write the cuff's wall-clock via BLE-standard Current Time Service (`0x2A2B`). See caveat below.       |
+| `probe`      | Subscribe to an arbitrary GATT characteristic by UUID and dump every notify/indicate. RE tool.        |
 | `list-models`| Print all 202 supported model IDs (canonical profiles + aliases).                                     |
 
 Run `omron <subcommand> --help` for flags.
@@ -150,6 +151,19 @@ needs hardware to exercise.
 
 ## Known limitations
 
+- **EKG strip data is not accessible via BLE on the Omron Complete**
+  (BP7900) — at least not from this firmware revision and not via
+  any of its indicate/notify characteristics. The vendor channel
+  `c195da8a-0e23-4582-acd8-d446c77c45de` on service `5df5e817-…` is
+  *not* an EKG stream; it's an alternative encoding of stored BP
+  records that the cuff dumps on first subscribe (20-byte data + 11-byte
+  status packets per record, sequence-numbered, content identical to
+  what you get via the standard `0x2A35` / RACP path). The
+  `8858eb40-…` "AFib I2" channel on the proprietary modern-stack
+  service is silent during a real EKG trigger. Cracking this would
+  most likely need HCI snoop logs from an Android phone running the
+  official Omron Connect app — out of scope for now. `omron probe`
+  is in the binary to help if you want to try.
 - **`set-time` on the Omron Complete (BP7900) fails with ATT `0x80`** even
   after a fresh OS bond. The cuff's CTS write permission is set to
   "encrypted + authenticated", but Just Works pairing (the only model
