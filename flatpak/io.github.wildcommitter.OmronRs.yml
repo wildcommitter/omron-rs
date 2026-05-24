@@ -12,8 +12,11 @@
 # and ships it as a GitHub Release artifact.
 
 app-id: io.github.wildcommitter.OmronRs
+# 24.08 is the current freedesktop runtime; 23.08 is EOL. The rust-stable
+# SDK extension on 24.08 ships cargo ≥ 1.85, which is needed because some
+# of our transitive deps (e.g. bluez-async 0.8) require edition2024.
 runtime: org.freedesktop.Platform
-runtime-version: '23.08'
+runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable

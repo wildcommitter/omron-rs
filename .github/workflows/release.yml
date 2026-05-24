@@ -23,7 +23,7 @@ jobs:
     # the build inside this container can stay offline-friendly
     # (everything except the crates.io fetches is local).
     container:
-      image: bilelmoussaoui/flatpak-github-actions:freedesktop-23.08
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-24.08
       options: --privileged
     steps:
       - name: Check out source
