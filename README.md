@@ -67,17 +67,18 @@ $ omron info 00:5F:BF:A2:C6:C9
   Firmware Rev (0x2A26)    = "D.00.7FB-12"
   …
 
-# 3. Bond at the OS level (one-time; put the cuff in -P-, then run):
-$ bluetoothctl
-[bluetoothctl]> agent NoInputNoOutput
-[bluetoothctl]> default-agent
-[bluetoothctl]> scan on
-[bluetoothctl]> pair 00:5F:BF:A2:C6:C9
-[CHG] Device 00:5F:BF:A2:C6:C9 Bonded: yes
-Pairing successful
+# 3. Pair (one-time; put the cuff in -P- first). Registers an in-process
+#    BlueZ Just-Works agent, does the OS-level bond, and programs the
+#    app-level pairing key into the cuff's EEPROM — all in one shot.
+$ omron pair 00:5F:BF:A2:C6:C9 --model HEM-7530T-Z
+Registered Just-Works pairing agent on adapter hci0.
+Bonding via BlueZ Just-Works… OS-level bond established.
+… Pairing + time sync complete.
 
-# 4. Drain every stored measurement
+# 4. Drain every stored measurement. Reuses the bond from step 3 — no
+#    -P- needed; just wake the cuff (e.g. take a measurement).
 $ omron sync 00:5F:BF:A2:C6:C9
+Reusing existing OS bond with 00:5F:BF:A2:C6:C9 (pass --bond to force refresh).
 2026-05-20 08:52:42  108/64 mmHg  MAP 78  78 bpm user=1
 2026-05-20 08:53:56  109/62 mmHg  MAP 77  77 bpm user=1
 …
@@ -99,21 +100,19 @@ reading and immediately run the CLI.
 
 ## Linux / BlueZ note
 
-Both `read-bps` and `sync` require an **OS-level bond** because the BLE-SIG BP
-characteristics are encryption-required. The cuff invalidates its stored
-bond on every power-cycle, so re-pair via `bluetoothctl` before each session.
-A common pattern:
+`omron pair`, `omron sync`, and `omron read-bps` register an **in-process
+Just-Works pairing agent** (via the `bluer` crate) on the BlueZ system
+bus, so the bonding flow runs end-to-end inside the binary — no external
+`bluetoothctl` shell required. `pair` always forces a fresh SMP exchange
+(the cuff is in `-P-`, so this is the right thing); `sync` and
+`read-bps` reuse any cached bond by default and re-bond only when given
+`--bond` (which then needs the cuff in `-P-`).
 
-```sh
-# In one shell, keep a bluetoothctl agent alive:
-echo -e 'agent NoInputNoOutput\ndefault-agent\nscan on\n' | bluetoothctl
+Omron cuffs typically purge their bond table on every power cycle. If
+`sync` / `read-bps` fail with `AuthenticationFailed` after the cuff was
+powered down, re-run with `--bond` while in `-P-`.
 
-# In another shell, after pressing -P- on the cuff:
-bluetoothctl pair <addr>
-omron sync <addr>
-```
-
-`bluez_retry_connector` -style robust connection handling isn't implemented
+`bleak_retry_connector`-style robust connection handling isn't implemented
 yet, so flaky cuffs may need a couple of retries.
 
 ## Supported devices
@@ -150,10 +149,6 @@ needs hardware to exercise.
 
 ## Known limitations
 
-- **No OS-level pairing agent.** `omron pair` does the Omron app-level
-  handshake but relies on the user to bond via `bluetoothctl` separately.
-  Implementing an in-process BlueZ agent would let `omron pair` drive the
-  whole flow in one shot.
 - **Omron's "legacy probe"** (0x02+zeros on the unlock characteristic) is
   deliberately disabled — on the cuffs we tested it put the device into
   key-programming mode mid-unlock and broke the memory session. See the

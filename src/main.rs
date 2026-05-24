@@ -96,6 +96,12 @@ enum Command {
         /// Overall timeout in seconds.
         #[arg(long, default_value_t = 90)]
         timeout: u64,
+        /// Force a fresh OS-level pairing (drops any cached LTK first).
+        /// Use this when reads fail with authentication errors because
+        /// the cuff has rotated its bond table. Requires the cuff to be
+        /// in -P- mode. Linux only.
+        #[arg(long)]
+        bond: bool,
     },
     /// Subscribe to the BLE-standard Blood Pressure Service indications
     /// (UUID 0x2A35) and print each measurement as it arrives. Use this on
@@ -115,6 +121,12 @@ enum Command {
         /// Emit one JSON object per line instead of the table format.
         #[arg(long)]
         json: bool,
+        /// Force a fresh OS-level pairing (drops any cached LTK first).
+        /// Use this when subscribing fails with authentication errors
+        /// because the cuff has rotated its bond table. Requires the cuff
+        /// to be in -P- mode. Linux only.
+        #[arg(long)]
+        bond: bool,
     },
     /// List all supported model IDs (including catalog variants).
     ListModels,
@@ -133,11 +145,11 @@ async fn main() -> Result<()> {
         Command::Pair { address, model } => cmd_pair(address, model).await,
         Command::Read { address, model, latest, json } => cmd_read(address, model, latest, json).await,
         Command::Info { address } => cmd_info(address).await,
-        Command::ReadBps { address, timeout, count, json } => {
-            cmd_read_bps(address, timeout, count, json).await
+        Command::ReadBps { address, timeout, count, json, bond } => {
+            cmd_read_bps(address, timeout, count, json, bond).await
         }
-        Command::Sync { address, num_only, json, timeout } => {
-            cmd_sync(address, num_only, json, timeout).await
+        Command::Sync { address, num_only, json, timeout, bond } => {
+            cmd_sync(address, num_only, json, timeout, bond).await
         }
         Command::ListModels => {
             for m in supported_models() {
@@ -188,42 +200,57 @@ async fn resolve_model(peripheral: &btleplug::platform::Peripheral, override_: O
     Ok(DEFAULT_DEVICE_MODEL.to_string())
 }
 
+/// Establish (or verify) an OS-level BlueZ bond with the cuff. Returns
+/// the `BondingSession` so the caller can keep the agent registered and
+/// the bond active for the rest of the operation.
+///
+/// `force_fresh` controls whether we drop any cached LTK first and force
+/// a brand-new SMP exchange:
+/// * `true` for `pair` — the whole point is to set up a fresh bond, and
+///   Omron cuffs purge their bond on every power cycle anyway.
+/// * `false` for `sync` / `read-bps` by default — fast path that just
+///   reuses an existing bond. Pass `--bond` on the CLI to force a
+///   refresh when the cached LTK has gone stale.
+#[cfg(target_os = "linux")]
+async fn establish_os_bond(address: &str, force_fresh: bool) -> Result<omron_rs::bluez_agent::BondingSession> {
+    use omron_rs::bluez_agent::{parse_address, BondingSession};
+    let addr = parse_address(address)?;
+    let session = BondingSession::new()
+        .await
+        .context("register in-process BlueZ pairing agent")?;
+    println!(
+        "Registered Just-Works pairing agent on adapter {}.",
+        session.adapter_name()
+    );
+    if force_fresh {
+        let _ = session.forget(addr).await;
+    } else if session.is_paired(addr).await.unwrap_or(false) {
+        println!("Reusing existing OS bond with {address} (pass --bond to force refresh).");
+        return Ok(session);
+    }
+    session
+        .ensure_discovered(addr, Duration::from_secs(15))
+        .await
+        .context("device did not appear in BlueZ discovery (is it advertising?)")?;
+    println!("Bonding with {address} via BlueZ Just-Works…");
+    session
+        .pair_and_trust(addr, Duration::from_secs(30))
+        .await?;
+    println!("OS-level bond established.");
+    Ok(session)
+}
+
 async fn cmd_pair(address: String, model_override: Option<String>) -> Result<()> {
     println!(
         "Make sure the device is showing the blinking -P- pairing prompt. \
          (Hold the Bluetooth button on the cuff until -P- appears.)"
     );
 
-    // Step 1: in-process BlueZ pairing agent + OS-level bond.  Doing this
-    // before our app-level handshake means the encryption-required GATT
-    // channels (RX/TX for memory protocol, RACP, BPS measurement) become
-    // usable without the user having to keep a bluetoothctl session
-    // alive in another shell.  Linux-only.
+    // Step 1: OS-level bond. Always force-fresh here — `pair` is the
+    // setup operation, and the cuff's matching key is also about to be
+    // re-programmed.
     #[cfg(target_os = "linux")]
-    let bonding = {
-        use omron_rs::bluez_agent::{parse_address, BondingSession};
-        let bluer_addr = parse_address(&address)?;
-        let session = BondingSession::new()
-            .await
-            .context("register in-process BlueZ pairing agent")?;
-        println!(
-            "Registered Just-Works pairing agent on adapter {}.",
-            session.adapter_name()
-        );
-        // Drop any stale BlueZ bond — Omron cuffs purge their bond on
-        // every power cycle, so an old LTK in BlueZ would be rejected.
-        let _ = session.forget(bluer_addr).await;
-        session
-            .ensure_discovered(bluer_addr, Duration::from_secs(15))
-            .await
-            .context("device did not appear in BlueZ discovery")?;
-        println!("Bonding with {address} via BlueZ Just-Works…");
-        session
-            .pair_and_trust(bluer_addr, Duration::from_secs(30))
-            .await?;
-        println!("OS-level bond established.");
-        session
-    };
+    let bonding = establish_os_bond(&address, true).await?;
 
     // Step 2: locate the peripheral via btleplug for the app-level pair.
     let adapter = default_adapter().await?;
@@ -388,9 +415,18 @@ async fn cmd_sync(
     num_only: bool,
     json: bool,
     timeout_secs: u64,
+    bond: bool,
 ) -> Result<()> {
     use btleplug::api::WriteType;
     use omron_rs::racp::RacpIndication;
+
+    // Ensure an OS bond. By default we reuse any existing bond
+    // (`force_fresh=false`); with `--bond` we drop the cached LTK and do
+    // a fresh SMP, which requires the cuff to be in -P-.
+    #[cfg(target_os = "linux")]
+    let _bonding = establish_os_bond(&address, bond).await?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = bond;
 
     let adapter = default_adapter().await?;
     if !json {
@@ -539,7 +575,15 @@ async fn cmd_read_bps(
     timeout_secs: u64,
     count_limit: usize,
     json: bool,
+    bond: bool,
 ) -> Result<()> {
+    // Ensure an OS bond. Default fast path reuses any existing bond;
+    // `--bond` forces a fresh SMP (cuff must be in -P-).
+    #[cfg(target_os = "linux")]
+    let _bonding = establish_os_bond(&address, bond).await?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = bond;
+
     let adapter = default_adapter().await?;
     if !json {
         println!("Scanning for {address}…");
