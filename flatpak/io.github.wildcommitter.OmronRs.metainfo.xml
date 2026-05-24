@@ -33,6 +33,14 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.1.1" date="2026-05-24">
+      <description>
+        <p>Verified the v0.1.0 bundle end-to-end on real hardware via the
+        Flatpak sandbox (`sync` against an Omron Complete, 90 records to
+        CSV through `--system-talk-name=org.bluez`). No code changes;
+        version bump cuts a fresh release artifact.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-05-24">
       <description>
         <p>Initial Flatpak release.</p>
