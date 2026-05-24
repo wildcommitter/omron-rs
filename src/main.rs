@@ -189,6 +189,43 @@ async fn resolve_model(peripheral: &btleplug::platform::Peripheral, override_: O
 }
 
 async fn cmd_pair(address: String, model_override: Option<String>) -> Result<()> {
+    println!(
+        "Make sure the device is showing the blinking -P- pairing prompt. \
+         (Hold the Bluetooth button on the cuff until -P- appears.)"
+    );
+
+    // Step 1: in-process BlueZ pairing agent + OS-level bond.  Doing this
+    // before our app-level handshake means the encryption-required GATT
+    // channels (RX/TX for memory protocol, RACP, BPS measurement) become
+    // usable without the user having to keep a bluetoothctl session
+    // alive in another shell.  Linux-only.
+    #[cfg(target_os = "linux")]
+    let bonding = {
+        use omron_rs::bluez_agent::{parse_address, BondingSession};
+        let bluer_addr = parse_address(&address)?;
+        let session = BondingSession::new()
+            .await
+            .context("register in-process BlueZ pairing agent")?;
+        println!(
+            "Registered Just-Works pairing agent on adapter {}.",
+            session.adapter_name()
+        );
+        // Drop any stale BlueZ bond — Omron cuffs purge their bond on
+        // every power cycle, so an old LTK in BlueZ would be rejected.
+        let _ = session.forget(bluer_addr).await;
+        session
+            .ensure_discovered(bluer_addr, Duration::from_secs(15))
+            .await
+            .context("device did not appear in BlueZ discovery")?;
+        println!("Bonding with {address} via BlueZ Just-Works…");
+        session
+            .pair_and_trust(bluer_addr, Duration::from_secs(30))
+            .await?;
+        println!("OS-level bond established.");
+        session
+    };
+
+    // Step 2: locate the peripheral via btleplug for the app-level pair.
     let adapter = default_adapter().await?;
     println!("Scanning for {address}…");
     let peripheral = find_peripheral_by_address(&adapter, &address)
@@ -196,14 +233,16 @@ async fn cmd_pair(address: String, model_override: Option<String>) -> Result<()>
         .context("could not find the device — is it powered on and in range?")?;
     let resolved_model = resolve_model(&peripheral, model_override).await?;
     println!("Using model profile: {resolved_model}");
-    println!(
-        "Make sure the device is showing the blinking -P- pairing prompt. \
-         (Hold the Bluetooth button on the cuff until -P- appears.)"
-    );
+
     pair_and_sync_device(peripheral, &resolved_model, Some(get_device_config(&resolved_model)))
         .await
         .map_err(|e| anyhow!(e))?;
     println!("Pairing + time sync complete.");
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = bonding.close().await;
+    }
     Ok(())
 }
 

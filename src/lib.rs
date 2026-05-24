@@ -3,6 +3,8 @@
 //! from Omron blood-pressure monitors.
 
 pub mod ble;
+#[cfg(target_os = "linux")]
+pub mod bluez_agent;
 pub mod bps;
 pub mod consts;
 pub mod device_catalog;
