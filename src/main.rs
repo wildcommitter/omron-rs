@@ -9,10 +9,12 @@ use btleplug::api::Peripheral as _;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+use futures::StreamExt;
 use omron_rs::ble::{default_adapter, find_peripheral_by_address, scan_for_omron};
+use omron_rs::bps::{decode_bp_measurement, BpsMeasurement};
 use omron_rs::consts::{
-    BATTERY_LEVEL_UUID, DEFAULT_DEVICE_MODEL, FIRMWARE_REVISION_UUID, HARDWARE_REVISION_UUID,
-    MANUFACTURER_NAME_UUID, MODEL_NUMBER_UUID,
+    BATTERY_LEVEL_UUID, BP_MEASUREMENT_CHAR_UUID, DEFAULT_DEVICE_MODEL, FIRMWARE_REVISION_UUID,
+    HARDWARE_REVISION_UUID, MANUFACTURER_NAME_UUID, MODEL_NUMBER_UUID,
 };
 use omron_rs::devices::{get_device_config, infer_model_id_from_local_name, supported_models};
 use omron_rs::driver::OmronDeviceDriver;
@@ -74,6 +76,25 @@ enum Command {
         /// Bluetooth MAC address of the cuff.
         address: String,
     },
+    /// Subscribe to the BLE-standard Blood Pressure Service indications
+    /// (UUID 0x2A35) and print each measurement as it arrives. Use this on
+    /// devices that don't support the Omron memory protocol (e.g. the
+    /// BP7900 / "Omron Complete"). Requires OS-level bonding first
+    /// (`bluetoothctl pair <addr>`).
+    ReadBps {
+        /// Bluetooth MAC address of the cuff.
+        address: String,
+        /// Seconds to wait for indications. After this expires the binary
+        /// disconnects and exits.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Exit after this many measurements have been received. 0 = no limit.
+        #[arg(long, default_value_t = 0)]
+        count: usize,
+        /// Emit one JSON object per line instead of the table format.
+        #[arg(long)]
+        json: bool,
+    },
     /// List all supported model IDs (including catalog variants).
     ListModels,
 }
@@ -91,6 +112,9 @@ async fn main() -> Result<()> {
         Command::Pair { address, model } => cmd_pair(address, model).await,
         Command::Read { address, model, latest, json } => cmd_read(address, model, latest, json).await,
         Command::Info { address } => cmd_info(address).await,
+        Command::ReadBps { address, timeout, count, json } => {
+            cmd_read_bps(address, timeout, count, json).await
+        }
         Command::ListModels => {
             for m in supported_models() {
                 println!("{m}");
@@ -294,6 +318,128 @@ async fn cmd_info(address: String) -> Result<()> {
         );
     }
     Ok(())
+}
+
+async fn cmd_read_bps(
+    address: String,
+    timeout_secs: u64,
+    count_limit: usize,
+    json: bool,
+) -> Result<()> {
+    let adapter = default_adapter().await?;
+    if !json {
+        println!("Scanning for {address}…");
+    }
+    let peripheral = find_peripheral_by_address(&adapter, &address)
+        .await
+        .context("could not find the device — is it powered on and in range?")?;
+    establish_connection(&peripheral).await?;
+
+    // Locate the standard BP Measurement characteristic (0x2A35).
+    let char = peripheral
+        .characteristics()
+        .into_iter()
+        .find(|c| c.uuid == BP_MEASUREMENT_CHAR_UUID)
+        .ok_or_else(|| {
+            anyhow!(
+                "device does not expose BP Measurement characteristic {} \
+                 — it may not implement the BLE-standard BP Service",
+                BP_MEASUREMENT_CHAR_UUID
+            )
+        })?;
+
+    // Open the notification stream BEFORE subscribing so we don't miss the
+    // first indication.
+    let mut stream = peripheral.notifications().await?;
+    peripheral.subscribe(&char).await.context(
+        "subscribe to 0x2A35 failed — usually means the cuff requires OS-level \
+         bonding first (run `bluetoothctl pair <addr>` in a separate shell)",
+    )?;
+
+    if !json {
+        println!(
+            "Subscribed to {} (BP Measurement, indicate). Waiting up to {}s for measurements{}…",
+            BP_MEASUREMENT_CHAR_UUID,
+            timeout_secs,
+            if count_limit > 0 { format!(" (max {})", count_limit) } else { String::new() },
+        );
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut received = 0usize;
+    let mut all: Vec<BpsMeasurement> = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let next = tokio::time::timeout(remaining, stream.next()).await;
+        match next {
+            Err(_) => break, // overall deadline
+            Ok(None) => break, // stream ended
+            Ok(Some(n)) => {
+                if n.uuid != BP_MEASUREMENT_CHAR_UUID {
+                    continue; // unrelated notify
+                }
+                match decode_bp_measurement(&n.value) {
+                    Ok(m) => {
+                        if json {
+                            println!("{}", serde_json::to_string(&m)?);
+                        } else {
+                            print_bps_measurement(&m);
+                        }
+                        all.push(m);
+                        received += 1;
+                        if count_limit > 0 && received >= count_limit {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("malformed indication ({}): {}", e, hex::encode(&n.value));
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = peripheral.unsubscribe(&char).await;
+    let _ = peripheral.disconnect().await;
+
+    if !json && received == 0 {
+        eprintln!(
+            "No BP measurements received within {}s. Take a measurement on the cuff \
+             (or wait for the device to push stored ones) while this is running.",
+            timeout_secs
+        );
+    }
+    let _ = all;
+    Ok(())
+}
+
+fn print_bps_measurement(m: &BpsMeasurement) {
+    let dt = m
+        .datetime
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let unit = match m.unit {
+        omron_rs::bps::BpUnit::Mmhg => "mmHg",
+        omron_rs::bps::BpUnit::Kpa => "kPa",
+    };
+    let bpm = m
+        .bpm
+        .map(|v| format!("{:.0} bpm", v))
+        .unwrap_or_else(|| "?bpm".into());
+    let user = m
+        .user_id
+        .map(|u| format!(" user={}", u))
+        .unwrap_or_default();
+    let status = m
+        .status
+        .map(|s| format!(" status={:#018b}", s.bits()))
+        .unwrap_or_default();
+    println!(
+        "{dt}  {sys:.0}/{dia:.0} {unit}  MAP {map:.0}  {bpm}{user}{status}",
+        sys = m.sys,
+        dia = m.dia,
+        map = m.map,
+    );
 }
 
 fn print_records(records: &[omron_rs::Record]) {

@@ -3,6 +3,7 @@
 //! from Omron blood-pressure monitors.
 
 pub mod ble;
+pub mod bps;
 pub mod consts;
 pub mod device_catalog;
 pub mod device_config;

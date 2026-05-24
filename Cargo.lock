@@ -758,6 +758,7 @@ name = "omron-rs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags",
  "btleplug",
  "chrono",
  "clap",
