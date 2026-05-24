@@ -31,7 +31,7 @@ use crate::pairing::{
 const MEMORY_PROTOCOL_REPLY_TIMEOUT: Duration = Duration::from_millis(3500);
 const MEMORY_PROTOCOL_TX_MAX_RETRIES: u32 = 4;
 const MEMORY_PROTOCOL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
-const NOTIFY_SUBSCRIBE_SETTLE: Duration = Duration::from_millis(750);
+const NOTIFY_SUBSCRIBE_SETTLE: Duration = Duration::from_millis(250);
 
 fn xor_crc(bytes: &[u8]) -> u8 {
     bytes.iter().fold(0u8, |a, b| a ^ *b)
@@ -152,6 +152,7 @@ impl GattTransport {
             while let Some(n) = stream.next().await {
                 let uuid = n.uuid;
                 let data = n.value;
+                tracing::trace!(uuid=%uuid, len=data.len(), hex=%hex::encode(&data), "RX notify");
 
                 if uuid == unlock_uuid {
                     let mut state = inner.state.lock().await;
@@ -304,6 +305,9 @@ impl GattTransport {
             };
             let num_tx_channels = (command.len() + channel_width - 1) / channel_width;
 
+            let connected_before = self.peripheral.is_connected().await.unwrap_or(false);
+            debug!(retry = retry + 1, connected = connected_before, cmd_head = %hex::encode(&command[..command.len().min(8)]), "TX start");
+
             let mut tx_ok = true;
             for ch_idx in 0..num_tx_channels {
                 let segment_end = ((ch_idx + 1) * channel_width).min(command.len());
@@ -322,12 +326,14 @@ impl GattTransport {
                 } else {
                     WriteType::WithResponse
                 };
+                tracing::trace!(ch = ch_idx, len = segment.len(), hex = %hex::encode(segment), "TX write");
                 if let Err(e) = self.peripheral.write(&c, segment, write_type).await {
-                    warn!(retry = retry + 1, %e, "BLE error during write");
+                    warn!(retry = retry + 1, ch = ch_idx, %e, "BLE error during write");
                     tx_ok = false;
                     break;
                 }
             }
+            debug!(retry = retry + 1, tx_ok, "TX end, awaiting reply");
             if !tx_ok {
                 if retry + 1 >= max_retries {
                     return Err(OmronError::Protocol("TX failed after retries".into()));
@@ -532,22 +538,18 @@ impl GattTransport {
         sleep(NOTIFY_SUBSCRIBE_SETTLE).await;
 
         let result: Result<()> = async {
-            if self.config.legacy_pairing_workarounds {
-                // Best-effort "confirm encryption" probe. We pin notified()
-                // *before* writing so the wakeup isn't lost if the response
-                // arrives before we start awaiting.
-                let notified = self.inner.unlock_notify.notified();
-                tokio::pin!(notified);
-                let probe = key_programming_probe_bytes();
-                if self
-                    .peripheral
-                    .write(&unlock_char, &probe, WriteType::WithResponse)
-                    .await
-                    .is_ok()
-                {
-                    let _ = timeout(Duration::from_secs(2), notified).await;
-                }
-            }
+            // NOTE: the upstream Python integration sends a "confirm
+            // encryption" probe (0x02 + 16 zeros) on the unlock characteristic
+            // for legacy_pairing_workarounds devices before the actual auth
+            // write, on the theory that some devices are more stable that
+            // way. On the BP7900-class "Omron Complete" cuff that probe
+            // actively puts the device into key-programming mode (cuff
+            // replies with 0x82), and subsequent memory-protocol commands
+            // are silently dropped. We don't issue the probe; if a specific
+            // profile ever turns out to require it, gate it behind a new
+            // DeviceConfig flag rather than enabling it for the whole
+            // legacy-pairing population.
+            let _ = key_programming_probe_bytes; // keep import alive for tests
 
             {
                 let mut s = self.inner.state.lock().await;
@@ -586,11 +588,11 @@ impl GattTransport {
         .await;
 
         let _ = self.peripheral.unsubscribe(&unlock_char).await;
-        if primed_rx {
-            if let Ok(rx0) = self.char_for(&self.config.rx_channel_uuids[0]).cloned() {
-                let _ = self.peripheral.unsubscribe(&rx0).await;
-            }
-        }
+        // NOTE: deliberately *not* unsubscribing RX0 here even if we primed it
+        // — open_memory_session() will subscribe all RX channels anyway, and
+        // toggling RX0 off-then-on burns ~200ms of GATT chatter on BlueZ,
+        // which the cuff sleeps through.
+        let _ = primed_rx;
         result
     }
 
