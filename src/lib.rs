@@ -11,6 +11,7 @@ pub mod devices;
 pub mod driver;
 pub mod error;
 pub mod pairing;
+pub mod racp;
 pub mod record_parsers;
 pub mod setup;
 pub mod time_sync;

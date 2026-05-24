@@ -13,9 +13,10 @@ use futures::StreamExt;
 use omron_rs::ble::{default_adapter, find_peripheral_by_address, scan_for_omron};
 use omron_rs::bps::{decode_bp_measurement, BpsMeasurement};
 use omron_rs::consts::{
-    BATTERY_LEVEL_UUID, BP_MEASUREMENT_CHAR_UUID, DEFAULT_DEVICE_MODEL, FIRMWARE_REVISION_UUID,
-    HARDWARE_REVISION_UUID, MANUFACTURER_NAME_UUID, MODEL_NUMBER_UUID,
+    BATTERY_LEVEL_UUID, BP_MEASUREMENT_CHAR_UUID, BP_RACP_CHAR_UUID, DEFAULT_DEVICE_MODEL,
+    FIRMWARE_REVISION_UUID, HARDWARE_REVISION_UUID, MANUFACTURER_NAME_UUID, MODEL_NUMBER_UUID,
 };
+use omron_rs::racp;
 use omron_rs::devices::{get_device_config, infer_model_id_from_local_name, supported_models};
 use omron_rs::driver::OmronDeviceDriver;
 use omron_rs::setup::{establish_connection, fetch_device_model_number, pair_and_sync_device};
@@ -76,6 +77,26 @@ enum Command {
         /// Bluetooth MAC address of the cuff.
         address: String,
     },
+    /// Drain every stored measurement from the device via the BLE-standard
+    /// Record Access Control Point (RACP, UUID 0x2A52). Each stored record
+    /// arrives as a 0x2A35 indication, then the device sends a RACP
+    /// completion response when done. Use on cuffs that expose RACP (most
+    /// BPS-compliant devices); for Omron's classic memory-protocol cuffs use
+    /// `read` instead. Requires OS-level bonding first
+    /// (`bluetoothctl pair <addr>`).
+    Sync {
+        /// Bluetooth MAC address of the cuff.
+        address: String,
+        /// Just report the number of stored records — don't fetch them.
+        #[arg(long)]
+        num_only: bool,
+        /// Emit one JSON object per record instead of the table format.
+        #[arg(long)]
+        json: bool,
+        /// Overall timeout in seconds.
+        #[arg(long, default_value_t = 90)]
+        timeout: u64,
+    },
     /// Subscribe to the BLE-standard Blood Pressure Service indications
     /// (UUID 0x2A35) and print each measurement as it arrives. Use this on
     /// devices that don't support the Omron memory protocol (e.g. the
@@ -114,6 +135,9 @@ async fn main() -> Result<()> {
         Command::Info { address } => cmd_info(address).await,
         Command::ReadBps { address, timeout, count, json } => {
             cmd_read_bps(address, timeout, count, json).await
+        }
+        Command::Sync { address, num_only, json, timeout } => {
+            cmd_sync(address, num_only, json, timeout).await
         }
         Command::ListModels => {
             for m in supported_models() {
@@ -316,6 +340,157 @@ async fn cmd_info(address: String) -> Result<()> {
             model_str,
             inferred.as_deref().unwrap_or("(unrecognized — use --model to override)")
         );
+    }
+    Ok(())
+}
+
+async fn cmd_sync(
+    address: String,
+    num_only: bool,
+    json: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    use btleplug::api::WriteType;
+    use omron_rs::racp::RacpIndication;
+
+    let adapter = default_adapter().await?;
+    if !json {
+        println!("Scanning for {address}…");
+    }
+    let peripheral = find_peripheral_by_address(&adapter, &address)
+        .await
+        .context("could not find the device — is it powered on and in range?")?;
+    establish_connection(&peripheral).await?;
+
+    let chars: Vec<_> = peripheral.characteristics().into_iter().collect();
+    let bp_char = chars
+        .iter()
+        .find(|c| c.uuid == BP_MEASUREMENT_CHAR_UUID)
+        .cloned()
+        .ok_or_else(|| anyhow!("device does not expose BP Measurement char {}", BP_MEASUREMENT_CHAR_UUID))?;
+    let racp_char = chars
+        .iter()
+        .find(|c| c.uuid == BP_RACP_CHAR_UUID)
+        .cloned()
+        .ok_or_else(|| {
+            anyhow!(
+                "device does not expose RACP char {} — it may not support stored-record sync",
+                BP_RACP_CHAR_UUID
+            )
+        })?;
+
+    let mut stream = peripheral.notifications().await?;
+    // Subscribe to RACP first (so the device knows we can hear its responses)
+    // then to BP Measurement.
+    peripheral.subscribe(&racp_char).await.context(
+        "subscribe to RACP (0x2A52) failed — usually means OS bonding is missing \
+         (run `bluetoothctl pair <addr>` in a separate shell)",
+    )?;
+    peripheral.subscribe(&bp_char).await?;
+
+    // Send the request.
+    let request = if num_only {
+        racp::build_report_number_of_records()
+    } else {
+        racp::build_report_all_records()
+    };
+    if !json {
+        println!(
+            "Sending RACP request {} ({})…",
+            hex::encode(request),
+            if num_only { "Report Number of Stored Records" } else { "Report All Stored Records" }
+        );
+    }
+    peripheral
+        .write(&racp_char, &request, WriteType::WithResponse)
+        .await
+        .context("RACP write failed")?;
+
+    // Collect data-char indications until RACP sends a completion.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut records: Vec<BpsMeasurement> = Vec::new();
+    let mut completion: Option<RacpIndication> = None;
+    let mut announced_count: Option<u16> = None;
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        let next = tokio::time::timeout(remaining, stream.next()).await;
+        match next {
+            Err(_) => break, // overall deadline
+            Ok(None) => break, // stream closed
+            Ok(Some(n)) => {
+                if n.uuid == BP_MEASUREMENT_CHAR_UUID {
+                    match decode_bp_measurement(&n.value) {
+                        Ok(m) => {
+                            if json {
+                                println!("{}", serde_json::to_string(&m)?);
+                            } else {
+                                print_bps_measurement(&m);
+                            }
+                            records.push(m);
+                        }
+                        Err(e) => eprintln!(
+                            "malformed BP indication ({}): {}",
+                            e,
+                            hex::encode(&n.value)
+                        ),
+                    }
+                } else if n.uuid == BP_RACP_CHAR_UUID {
+                    match racp::decode_indication(&n.value) {
+                        Ok(ind) => match ind {
+                            RacpIndication::NumberOfRecords(n) => {
+                                announced_count = Some(n);
+                                if !json {
+                                    println!("Device reports {} stored record(s).", n);
+                                }
+                                if num_only {
+                                    completion = Some(ind);
+                                    break;
+                                }
+                            }
+                            RacpIndication::Response { .. } => {
+                                completion = Some(ind);
+                                break;
+                            }
+                        },
+                        Err(e) => eprintln!(
+                            "malformed RACP indication ({}): {}",
+                            e,
+                            hex::encode(&n.value)
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = peripheral.unsubscribe(&bp_char).await;
+    let _ = peripheral.unsubscribe(&racp_char).await;
+    let _ = peripheral.disconnect().await;
+
+    if !json {
+        match completion {
+            Some(RacpIndication::Response { request, result }) => {
+                println!(
+                    "RACP completion: request={:?} result={:?} (received {} record(s))",
+                    request,
+                    result,
+                    records.len()
+                );
+            }
+            Some(RacpIndication::NumberOfRecords(_)) | None if num_only => {}
+            None => {
+                eprintln!(
+                    "Timed out waiting for RACP completion after {}s ({} record(s) received{}).",
+                    timeout_secs,
+                    records.len(),
+                    announced_count
+                        .map(|n| format!(", expected {}", n))
+                        .unwrap_or_default()
+                );
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
