@@ -1,6 +1,6 @@
 [package]
 name = "omron-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "CLI to pair, connect, and read measurements from Omron BLE blood pressure monitors. Rust port of hass-omron."
 license = "MIT"

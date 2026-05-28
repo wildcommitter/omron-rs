@@ -33,6 +33,15 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.2.1" date="2026-05-28">
+      <description>
+        <p>CI maintenance: bump the release workflow's GitHub Actions
+        to Node-24-compatible majors (`actions/checkout` v6,
+        `softprops/action-gh-release` v3, `actions/upload-artifact` v7)
+        ahead of GitHub's Node 20 deprecation on 2026-09-16. No code
+        changes.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-05-28">
       <description>
         <p>Adds `omron sync --delete-after`: after a successful
