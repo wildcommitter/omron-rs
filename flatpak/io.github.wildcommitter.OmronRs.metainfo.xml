@@ -33,6 +33,17 @@
     <category>Utility</category>
   </categories>
   <releases>
+    <release version="0.2.0" date="2026-05-28">
+      <description>
+        <p>Adds `omron sync --delete-after`: after a successful
+        Report-All-Stored-Records, send RACP Delete-All-Stored-Records
+        (0x02 0x01) to wipe the cuff's history. The delete only fires
+        when the report leg completed with result code Success; on
+        timeout / partial completion it is skipped so a half-finished
+        sync can never lose records. Refuses to combine with
+        `--num-only`.</p>
+      </description>
+    </release>
     <release version="0.1.1" date="2026-05-24">
       <description>
         <p>Verified the v0.1.0 bundle end-to-end on real hardware via the
