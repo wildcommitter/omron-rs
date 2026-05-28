@@ -105,6 +105,14 @@ enum Command {
         /// in -P- mode. Linux only.
         #[arg(long)]
         bond: bool,
+        /// After a successful Report-All-Stored-Records completion,
+        /// send RACP Delete-All-Stored-Records (0x02 0x01) to wipe the
+        /// cuff's history. Destructive: records are gone from the device
+        /// once it acks. Requires that the report finished with result
+        /// code Success; on timeout / partial completion the delete is
+        /// skipped. Incompatible with `--num-only`.
+        #[arg(long)]
+        delete_after: bool,
     },
     /// Subscribe to the BLE-standard Blood Pressure Service indications
     /// (UUID 0x2A35) and print each measurement as it arrives. Use this on
@@ -209,8 +217,8 @@ async fn main() -> Result<()> {
         Command::ReadBps { address, timeout, count, json, bond } => {
             cmd_read_bps(address, timeout, count, json, bond).await
         }
-        Command::Sync { address, num_only, format, timeout, bond } => {
-            cmd_sync(address, num_only, format, timeout, bond).await
+        Command::Sync { address, num_only, format, timeout, bond, delete_after } => {
+            cmd_sync(address, num_only, format, timeout, bond, delete_after).await
         }
         Command::SetTime { address, no_tz, verify, bond } => {
             cmd_set_time(address, no_tz, verify, bond).await
@@ -485,9 +493,17 @@ async fn cmd_sync(
     format: OutputFormat,
     timeout_secs: u64,
     bond: bool,
+    delete_after: bool,
 ) -> Result<()> {
     use btleplug::api::WriteType;
-    use omron_rs::racp::RacpIndication;
+    use omron_rs::racp::{OpCode, RacpIndication, ResultCode};
+
+    if delete_after && num_only {
+        return Err(anyhow!(
+            "--delete-after cannot be combined with --num-only: the cuff's records would be \
+             wiped without ever being read"
+        ));
+    }
 
     let human = format.is_human();
 
@@ -618,6 +634,79 @@ async fn cmd_sync(
         }
     }
 
+    // Optional second leg: explicit cleanup. Only runs when --delete-after
+    // is set AND the Report-All-Stored-Records procedure completed with
+    // result code Success. On timeout, NoRecordsFound, or any other result
+    // we deliberately skip the delete so a half-drained sync never wipes
+    // the cuff's history.
+    let report_succeeded = matches!(
+        completion,
+        Some(RacpIndication::Response {
+            request: OpCode::ReportStoredRecords,
+            result: ResultCode::Success,
+        })
+    );
+    let mut delete_outcome: Option<RacpIndication> = None;
+    if delete_after {
+        if !report_succeeded {
+            eprintln!(
+                "--delete-after: skipping RACP Delete (Report-All did not complete with Success)."
+            );
+        } else {
+            let delete_request = racp::build_delete_all_records();
+            if human {
+                println!(
+                    "Sending RACP request {} (Delete All Stored Records)…",
+                    hex::encode(delete_request)
+                );
+            }
+            match peripheral
+                .write(&racp_char, &delete_request, WriteType::WithResponse)
+                .await
+            {
+                Err(e) => eprintln!("RACP Delete write failed: {e}"),
+                Ok(()) => {
+                    let delete_deadline = tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(timeout_secs.min(30));
+                    while tokio::time::Instant::now() < delete_deadline {
+                        let remaining = delete_deadline - tokio::time::Instant::now();
+                        let next = tokio::time::timeout(remaining, stream.next()).await;
+                        match next {
+                            Err(_) => break,
+                            Ok(None) => break,
+                            Ok(Some(n)) => {
+                                if n.uuid != BP_RACP_CHAR_UUID {
+                                    continue;
+                                }
+                                match racp::decode_indication(&n.value) {
+                                    Ok(ind @ RacpIndication::Response {
+                                        request: OpCode::DeleteStoredRecords,
+                                        ..
+                                    }) => {
+                                        delete_outcome = Some(ind);
+                                        break;
+                                    }
+                                    Ok(other) => eprintln!(
+                                        "unexpected RACP indication during delete: {:?}",
+                                        other
+                                    ),
+                                    Err(e) => eprintln!(
+                                        "malformed RACP indication during delete ({}): {}",
+                                        e,
+                                        hex::encode(&n.value)
+                                    ),
+                                }
+                            }
+                        }
+                    }
+                    if delete_outcome.is_none() {
+                        eprintln!("Timed out waiting for RACP Delete completion.");
+                    }
+                }
+            }
+        }
+    }
+
     let _ = peripheral.unsubscribe(&bp_char).await;
     let _ = peripheral.unsubscribe(&racp_char).await;
     let _ = peripheral.disconnect().await;
@@ -644,6 +733,12 @@ async fn cmd_sync(
                 );
             }
             _ => {}
+        }
+        if let Some(RacpIndication::Response { request, result }) = delete_outcome {
+            println!(
+                "RACP cleanup: request={:?} result={:?}",
+                request, result
+            );
         }
     }
     Ok(())

@@ -113,6 +113,13 @@ CSV is `datetime,sys,dia,map,unit,bpm,user_id,status` and is ready to pipe
 into a spreadsheet or a SQLite `.import`. `--json` on `read-bps` and
 `read` emits one JSON record per line for piping into `jq`.
 
+Pass `--delete-after` to follow a successful drain with a RACP
+Delete-All-Stored-Records (`0x02 0x01`) so the cuff's history is wiped
+on the device. The delete only fires when Report-All completed with
+result code `Success`; on timeout or partial completion it's skipped so
+a half-finished sync can never lose records. Incompatible with
+`--num-only`.
+
 ## Pairing mode (`-P-`)
 
 For commands that need pairing (`pair`, and the first `bluetoothctl pair` for
